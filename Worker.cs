@@ -135,16 +135,14 @@ public class Worker : BackgroundService
                         {
                             _logger.LogError(ex, "HTTP request to SymX API failed {ErrorCode} - {ErrorMessage} for SymXCallId={SymXCallId}", ex.StatusCode, ex.Message, symxCall.SymXCallId);
                             success = false;
-                            var errorObj = new
+                            var errorObj = new SymXCallResponse()
                             {
-                                status = "error",
-                                error = new
-                                {
-                                    code = ex.StatusCode?.ToString() ?? "HttpRequestException",
-                                    message = ex.Message,
-                                    symxCallId = symxCall.SymXCallId,
-                                    correlationId = symxCall.CorrelationId
-                                }
+                                Status = "error",
+                                HttpStatusCode = (int) ex.StatusCode!,
+                                Timestamp = DateTime.UtcNow,
+                                Message = ex.Message,
+                                SymxCallId = symxCall.SymXCallId,
+                                CorrelationId = symxCall.CorrelationId
                             };
                             response = JsonSerializer.Serialize(errorObj);
                         }
@@ -173,7 +171,7 @@ public class Worker : BackgroundService
                                 symxCall.CallbackQueue,
                                 new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
                             await callbackQueue.CreateIfNotExistsAsync();
-                            await callbackQueue.SendMessageAsync(symxCall.CorrelationId?.ToString() ?? string.Empty, stoppingToken);
+                            await callbackQueue.SendMessageAsync(response ?? string.Empty, stoppingToken);
                             await _queue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt, stoppingToken);
                         }
                         else
