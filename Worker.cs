@@ -6,11 +6,7 @@ using Azure;
 using Azure.Storage.Queues;
 using Azure.Storage.Queues.Models;
 using Azure.Data.Tables;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Configuration;
-using Tsg.Rdc.Model.SymX;
+using Tsg.Models.SymX;
 
 namespace Tsg.SymxCaller;
 
