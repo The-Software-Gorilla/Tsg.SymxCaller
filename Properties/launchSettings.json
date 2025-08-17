@@ -6,12 +6,13 @@
       "dotnetRunMessages": true,
       "environmentVariables": {
         "DOTNET_ENVIRONMENT": "Development",
-        "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=https://127.0.0.1:10000/devstoreaccount1;QueueEndpoint=https://127.0.0.1:10001/devstoreaccount1;TableEndpoint=https://127.0.0.1:10002/devstoreaccount1;",
+        "AZURE_STORAGE_CONNECTION_STRING": "",
         "QUEUE_NAME": "symx-outbound",
         "TABLE_NAME": "symxOutbound",
         "VISIBILITY_TIMEOUT_SECONDS": "60",
         "POLL_DELAY_MS": "1500",
-        "MAX_DEQUEUE": "5"
+        "MAX_DEQUEUE": "5",
+        "ENDPOINT_KEY": ""
       }
     }
   }

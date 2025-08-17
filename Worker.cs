@@ -24,11 +24,13 @@ public class Worker : BackgroundService
     private readonly TimeSpan _pollDelay;
     private readonly int _maxDequeue;
     private readonly TableClient _tableClient;
+    private readonly string _endpointKey;
+    private readonly string _storageConnectionString;
 
     public Worker(ILogger<Worker> logger, IConfiguration cfg)
     {
         _logger = logger;
-        var conn = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONNECTION_STRING")
+        _storageConnectionString = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONNECTION_STRING")
                    ?? cfg["Queue:ConnectionString"]
                    ?? throw new InvalidOperationException("QUEUE_CONN not set");
 
@@ -37,6 +39,9 @@ public class Worker : BackgroundService
         
         var tableName = Environment.GetEnvironmentVariable("TABLE_NAME")
                    ?? cfg["Table:Name"] ?? "depositTransaction";
+        
+        _endpointKey = Environment.GetEnvironmentVariable("ENDPOINT_KEY")
+                       ?? cfg["SymX:EndpointKey"] ?? string.Empty;
 
         _visibility = TimeSpan.FromSeconds(
             int.TryParse(Environment.GetEnvironmentVariable("VISIBILITY_TIMEOUT_SEC"),
@@ -49,9 +54,9 @@ public class Worker : BackgroundService
         _maxDequeue = int.TryParse(Environment.GetEnvironmentVariable("MAX_DEQUEUE"),
             out var md) ? md : int.Parse(cfg["Queue:MaxDequeueBeforePoison"] ?? "5");
 
-        _queue = new QueueClient(conn, queueName, new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
-        _poisonQueue = new QueueClient(conn, $"{queueName}-poison", new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
-        _tableClient = new TableClient(conn, tableName);
+        _queue = new QueueClient(_storageConnectionString, queueName, new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
+        _poisonQueue = new QueueClient(_storageConnectionString, $"{queueName}-poison", new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
+        _tableClient = new TableClient(_storageConnectionString, tableName);
 
         _queue.CreateIfNotExists();
         _poisonQueue.CreateIfNotExists();
@@ -88,7 +93,7 @@ public class Worker : BackgroundService
                         var callId = msg.MessageText;
                         _logger.LogInformation("Received: {txId} (dequeue={cnt})", callId, msg.DequeueCount);
 
-                        // TODO: Do your work here
+                        // Get the corresponding Table entity
                         TableEntity entity;
                         try
                         {
@@ -117,26 +122,78 @@ public class Worker : BackgroundService
                         
                         var soapMessage = ConvertToSoap(symxCall.SymXEnvelope);
                         _logger.LogInformation("Converted SOAP message:\n{Soap}", soapMessage);
+
+                        string response;
+                        bool success = false;
+                        try
+                        {
+                            response = await CallSymxApiAsync(symxCall, soapMessage);
+                            success = true;
+                            _logger.LogInformation("SymX API response length: {Len}\n{Response}", response?.Length ?? 0, response);
+                        }
+                        catch (HttpRequestException ex)
+                        {
+                            _logger.LogError(ex, "HTTP request to SymX API failed {ErrorCode} - {ErrorMessage} for SymXCallId={SymXCallId}", ex.StatusCode, ex.Message, symxCall.SymXCallId);
+                            success = false;
+                            var errorObj = new
+                            {
+                                status = "error",
+                                error = new
+                                {
+                                    code = ex.StatusCode?.ToString() ?? "HttpRequestException",
+                                    message = ex.Message,
+                                    symxCallId = symxCall.SymXCallId,
+                                    correlationId = symxCall.CorrelationId
+                                }
+                            };
+                            response = JsonSerializer.Serialize(errorObj);
+                        }
                         
-                        var response = await CallSymxApiAsync(symxCall, soapMessage);
-                        _logger.LogInformation("SymX API response length: {Len}\n{Response}", response?.Length ?? 0, response);
+                        // Update Table entity with response/status
+                        if (!entity.TryGetValue("Attempts", out var attemptsObj) || attemptsObj is not int attempts)
+                        {
+                            attempts = 1;
+                        }
+                        else
+                        {
+                            attempts += 1;
+                        }
+                        entity["Attempts"] = attempts;
+                        entity["LastUpdatedUtc"] = DateTime.UtcNow;
+                        entity["Status"] = success ? "processed" : "error";
+                        entity["Response"] = response;
+                        await _tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
                         
-                        //TODO: Update Table entity with response/status
-                        //TODO: Queue a message to the callback queue
                         
-                        // If successful, delete from queue
-                        await _queue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt, stoppingToken);
+                        // Queue a message to the callback queue
+                        if (success)
+                        {
+                            var callbackQueue = new QueueClient(
+                                _storageConnectionString,
+                                symxCall.CallbackQueue,
+                                new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
+                            await callbackQueue.CreateIfNotExistsAsync();
+                            await callbackQueue.SendMessageAsync(symxCall.CorrelationId?.ToString() ?? string.Empty, stoppingToken);
+                            await _queue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt, stoppingToken);
+                        }
+                        else
+                        {
+                            if (msg.DequeueCount + 1 >= _maxDequeue)
+                            {
+                                await _poisonQueue.SendMessageAsync(msg.MessageText, stoppingToken);
+                            }
+                        }   
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error processing msgId={id} dequeue={cnt}", msg.MessageId, msg.DequeueCount);
+                        _logger.LogError(ex, "Error processing msgId={Id} dequeue={Count}", msg.MessageId, msg.DequeueCount);
 
                         // Move to poison if it’s looping too many times
                         if (msg.DequeueCount + 1 >= _maxDequeue)
                         {
                             await _poisonQueue.SendMessageAsync(msg.MessageText, stoppingToken);
                             await _queue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt, stoppingToken);
-                            _logger.LogWarning("Moved message to poison queue: {id}", msg.MessageId);
+                            _logger.LogWarning("Moved message to poison queue: {Id}", msg.MessageId);
                         }
                     }
                 }
@@ -182,7 +239,10 @@ public class Worker : BackgroundService
         };
         request.Headers.Add("x-Correlation-Id", call.CorrelationId ?? string.Empty);
         request.Headers.Add("x-SymX-Call-ID", call.SymXCallId ?? string.Empty);
-        // request.Headers.Add("Ocp-Apim-Subscription-Key", string.Empty);
+        if (!string.IsNullOrWhiteSpace(_endpointKey))
+        {
+            request.Headers.Add("Ocp-Apim-Subscription-Key", _endpointKey);
+        }
 
         _logger.LogInformation("Calling SymX API at {url} with SOAP message of length {len}", call.SymXInstanceUrl, soapMessage.Length);
 
