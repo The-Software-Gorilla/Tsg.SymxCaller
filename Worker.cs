@@ -6,16 +6,17 @@ using Azure;
 using Azure.Storage.Queues;
 using Azure.Storage.Queues.Models;
 using Azure.Data.Tables;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Tsg.Models.SymX;
 
 namespace Tsg.SymxCaller;
 
-public class Worker : BackgroundService
+public class Worker
 {
     private const string PartitionKey = "symxCall";
     private readonly ILogger<Worker> _logger;
-    private readonly QueueClient _queue;
-    private readonly QueueClient _poisonQueue;
     private readonly TimeSpan _visibility;
     private readonly TimeSpan _pollDelay;
     private readonly int _maxDequeue;
@@ -50,159 +51,100 @@ public class Worker : BackgroundService
         _maxDequeue = int.TryParse(Environment.GetEnvironmentVariable("MAX_DEQUEUE"),
             out var md) ? md : int.Parse(cfg["Queue:MaxDequeueBeforePoison"] ?? "5");
 
-        _queue = new QueueClient(_storageConnectionString, queueName, new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
-        _poisonQueue = new QueueClient(_storageConnectionString, $"{queueName}-poison", new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
+        // _queue = new QueueClient(_storageConnectionString, queueName, new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
+        // _poisonQueue = new QueueClient(_storageConnectionString, $"{queueName}-poison", new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
         _tableClient = new TableClient(_storageConnectionString, tableName);
 
-        _queue.CreateIfNotExists();
-        _poisonQueue.CreateIfNotExists();
+        // _queue.CreateIfNotExists();
+        // _poisonQueue.CreateIfNotExists();
     }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    
+    [Function(nameof(Worker))]
+    public async Task Run([QueueTrigger("symx-outbound", Connection = "AzureWebJobsStorage")] QueueMessage queueMessage)
     {
-        _logger.LogInformation("Queue reader started. queue={queue}", _queue.Name);
+        var callId = queueMessage.MessageText;
+        _logger.LogInformation("Received: {txId} (dequeue={cnt})", callId, queueMessage.DequeueCount);
 
-        // main loop
-        while (!stoppingToken.IsCancellationRequested)
+        // Get the corresponding Table entity
+        TableEntity entity;
+        try
         {
-            try
-            {
-                // Up to 16 at a time, with a visibility lock
-                QueueMessage[] messages = await _queue.ReceiveMessagesAsync(
-                    maxMessages: 16,
-                    visibilityTimeout: _visibility,
-                    cancellationToken: stoppingToken);
-
-                if (messages.Length == 0)
-                {
-                    await Task.Delay(_pollDelay, stoppingToken);
-                    continue;
-                }
-
-                foreach (var msg in messages)
-                {
-                    if (stoppingToken.IsCancellationRequested) break;
-
-                    try
-                    {
-                        // Your message is a transactionId string (per your upstream function)
-                        var callId = msg.MessageText;
-                        _logger.LogInformation("Received: {txId} (dequeue={cnt})", callId, msg.DequeueCount);
-
-                        // Get the corresponding Table entity
-                        TableEntity entity;
-                        try
-                        {
-                            var resp = _tableClient.GetEntity<TableEntity>( PartitionKey, callId);
-                            entity = resp.Value;
-                        }
-                        catch (RequestFailedException ex) when (ex.Status == 404)
-                        {
-                            _logger.LogError(ex, "No table entity found for PK={PK} RK={RK}", PartitionKey, callId);
-                            // If the entity is not found, we might want to consider this message processed
-                            // to avoid infinite retries. Adjust based on your requirements.
-                            await _queue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt, stoppingToken);
-                            continue;
-                        }
-                        
-                        if (!entity.TryGetValue("Call", out var raw) || raw is not string callJson || string.IsNullOrWhiteSpace(callJson))
-                        {
-                            _logger.LogError("Entity found but 'Xml' property is missing/empty. CallId={CallId}", callId);
-                            continue;
-                        }
-
-                        var symxCall = JsonSerializer.Deserialize<SymXCall>(callJson);
-                        
-                        _logger.LogInformation("Processing SymXCallId={SymXCallId} CorrelationId={CorrelationId}",
-                            symxCall.SymXCallId, symxCall.CorrelationId);
-                        
-                        var soapMessage = ConvertToSoap(symxCall.SymXEnvelope);
-                        _logger.LogInformation("Converted SOAP message:\n{Soap}", soapMessage);
-
-                        string response;
-                        bool success = false;
-                        try
-                        {
-                            response = await CallSymxApiAsync(symxCall, soapMessage);
-                            success = true;
-                            _logger.LogInformation("SymX API response length: {Len}\n{Response}", response?.Length ?? 0, response);
-                        }
-                        catch (HttpRequestException ex)
-                        {
-                            _logger.LogError(ex, "HTTP request to SymX API failed {ErrorCode} - {ErrorMessage} for SymXCallId={SymXCallId}", ex.StatusCode, ex.Message, symxCall.SymXCallId);
-                            success = false;
-                            var errorObj = new SymXCallResponse()
-                            {
-                                Status = "error",
-                                HttpStatusCode = (int) ex.StatusCode!,
-                                Timestamp = DateTime.UtcNow,
-                                Message = ex.Message,
-                                SymxCallId = symxCall.SymXCallId,
-                                CorrelationId = symxCall.CorrelationId
-                            };
-                            response = JsonSerializer.Serialize(errorObj);
-                        }
-                        
-                        // Update Table entity with response/status
-                        if (!entity.TryGetValue("Attempts", out var attemptsObj) || attemptsObj is not int attempts)
-                        {
-                            attempts = 1;
-                        }
-                        else
-                        {
-                            attempts += 1;
-                        }
-                        entity["Attempts"] = attempts;
-                        entity["LastUpdatedUtc"] = DateTime.UtcNow;
-                        entity["Status"] = success ? "processed" : "error";
-                        entity["Response"] = response;
-                        await _tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
-                        
-                        
-                        // Queue a message to the callback queue
-                        if (success)
-                        {
-                            var callbackQueue = new QueueClient(
-                                _storageConnectionString,
-                                symxCall.CallbackQueue,
-                                new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
-                            await callbackQueue.CreateIfNotExistsAsync();
-                            await callbackQueue.SendMessageAsync(response ?? string.Empty, stoppingToken);
-                            await _queue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt, stoppingToken);
-                        }
-                        else
-                        {
-                            if (msg.DequeueCount + 1 >= _maxDequeue)
-                            {
-                                await _poisonQueue.SendMessageAsync(msg.MessageText, stoppingToken);
-                            }
-                        }   
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error processing msgId={Id} dequeue={Count}", msg.MessageId, msg.DequeueCount);
-
-                        // Move to poison if it’s looping too many times
-                        if (msg.DequeueCount + 1 >= _maxDequeue)
-                        {
-                            await _poisonQueue.SendMessageAsync(msg.MessageText, stoppingToken);
-                            await _queue.DeleteMessageAsync(msg.MessageId, msg.PopReceipt, stoppingToken);
-                            _logger.LogWarning("Moved message to poison queue: {Id}", msg.MessageId);
-                        }
-                    }
-                }
-            }
-            catch (TaskCanceledException) { /* shutdown */ }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Queue poll failed; backing off");
-                // brief backoff on unexpected failures
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
-            }
+            var resp = _tableClient.GetEntity<TableEntity>( PartitionKey, callId);
+            entity = resp.Value;
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            _logger.LogError(ex, "No table entity found for PK={PK} RK={RK}", PartitionKey, callId);
+            // If the entity is not found, we might want to consider this message processed
+            // to avoid infinite retries. Adjust based on your requirements.
+            return;
+        }
+        
+        if (!entity.TryGetValue("Call", out var raw) || raw is not string callJson || string.IsNullOrWhiteSpace(callJson))
+        {
+            _logger.LogError("Entity found but 'Xml' property is missing/empty. CallId={CallId}", callId);
+            return;
         }
 
-        _logger.LogInformation("Queue reader stopping.");
+        var symxCall = JsonSerializer.Deserialize<SymXCall>(callJson);
         
+        _logger.LogInformation("Processing SymXCallId={SymXCallId} CorrelationId={CorrelationId}",
+            symxCall.SymXCallId, symxCall.CorrelationId);
+        
+        var soapMessage = ConvertToSoap(symxCall.SymXEnvelope);
+        _logger.LogInformation("Converted SOAP message:\n{Soap}", soapMessage);
+
+        string response;
+        bool success = false;
+        try
+        {
+            response = await CallSymxApiAsync(symxCall, soapMessage);
+            success = true;
+            _logger.LogInformation("SymX API response length: {Len}\n{Response}", response?.Length ?? 0, response);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "HTTP request to SymX API failed {ErrorCode} - {ErrorMessage} for SymXCallId={SymXCallId}", ex.StatusCode, ex.Message, symxCall.SymXCallId);
+            success = false;
+            var errorObj = new SymXCallResponse()
+            {
+                Status = "error",
+                HttpStatusCode = (int) ex.StatusCode!,
+                Timestamp = DateTime.UtcNow,
+                Message = ex.Message,
+                SymxCallId = symxCall.SymXCallId,
+                CorrelationId = symxCall.CorrelationId
+            };
+            response = JsonSerializer.Serialize(errorObj);
+        }
+        
+        // Update Table entity with response/status
+        if (!entity.TryGetValue("Attempts", out var attemptsObj) || attemptsObj is not int attempts)
+        {
+            attempts = 1;
+        }
+        else
+        {
+            attempts += 1;
+        }
+        entity["Attempts"] = attempts;
+        entity["LastUpdatedUtc"] = DateTime.UtcNow;
+        entity["Status"] = success ? "processed" : "error";
+        entity["Response"] = response;
+        await _tableClient.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace);
+        
+        
+        // Queue a message to the callback queue
+        if (success)
+        {
+            var callbackQueue = new QueueClient(
+                _storageConnectionString,
+                symxCall.CallbackQueue,
+                new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
+            await callbackQueue.CreateIfNotExistsAsync();
+            await callbackQueue.SendMessageAsync(response ?? string.Empty);
+            // await _queue.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt);
+        }
     }
     
     private string ConvertToSoap(SymXSoapEnvelope envelope)
