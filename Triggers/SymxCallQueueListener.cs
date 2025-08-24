@@ -27,9 +27,7 @@ public class SymxCallQueueListener
     public SymxCallQueueListener(ILogger<SymxCallQueueListener> logger, IConfiguration cfg)
     {
         _logger = logger;
-        _storageConnectionString = Environment.GetEnvironmentVariable(StorageConnectionStringEnvVar)
-                   ?? cfg["Queue:ConnectionString"]
-                   ?? throw new InvalidOperationException("QUEUE_CONN not set");
+                   ?? throw new InvalidOperationException($"{StorageConnectionStringEnvVar} environment variable not set");
 
         
         _endpointKey = Environment.GetEnvironmentVariable("ENDPOINT_KEY")
