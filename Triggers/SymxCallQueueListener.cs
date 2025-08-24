@@ -3,64 +3,41 @@ using System.Text.Json;
 using System.Xml;
 using System.Xml.Serialization;
 using Azure;
+using Azure.Data.Tables;
 using Azure.Storage.Queues;
 using Azure.Storage.Queues.Models;
-using Azure.Data.Tables;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Tsg.Models.SymX;
 
-namespace Tsg.SymxCaller;
+namespace Tsg.SymxCaller.Triggers;
 
-public class Worker
+public class SymxCallQueueListener
 {
     private const string PartitionKey = "symxCall";
-    private readonly ILogger<Worker> _logger;
-    private readonly TimeSpan _visibility;
-    private readonly TimeSpan _pollDelay;
-    private readonly int _maxDequeue;
+    private const string TableName = "symxOutbound";
+    private const string QueueName = "symx-outbound";
+    private const string StorageConnectionStringEnvVar = "AzureWebJobsStorage";
+    private readonly ILogger<SymxCallQueueListener> _logger;
     private readonly TableClient _tableClient;
     private readonly string _endpointKey;
     private readonly string _storageConnectionString;
 
-    public Worker(ILogger<Worker> logger, IConfiguration cfg)
+    public SymxCallQueueListener(ILogger<SymxCallQueueListener> logger, IConfiguration cfg)
     {
         _logger = logger;
-        _storageConnectionString = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONNECTION_STRING")
-                   ?? cfg["Queue:ConnectionString"]
-                   ?? throw new InvalidOperationException("QUEUE_CONN not set");
+                   ?? throw new InvalidOperationException($"{StorageConnectionStringEnvVar} environment variable not set");
 
-        var queueName = Environment.GetEnvironmentVariable("QUEUE_NAME")
-                   ?? cfg["Queue:Name"] ?? "deposit-inbound";
-        
-        var tableName = Environment.GetEnvironmentVariable("TABLE_NAME")
-                   ?? cfg["Table:Name"] ?? "depositTransaction";
         
         _endpointKey = Environment.GetEnvironmentVariable("ENDPOINT_KEY")
                        ?? cfg["SymX:EndpointKey"] ?? string.Empty;
-
-        _visibility = TimeSpan.FromSeconds(
-            int.TryParse(Environment.GetEnvironmentVariable("VISIBILITY_TIMEOUT_SEC"),
-                out var vts) ? vts : int.Parse(cfg["Queue:VisibilityTimeoutSeconds"] ?? "60"));
-
-        _pollDelay = TimeSpan.FromMilliseconds(
-            int.TryParse(Environment.GetEnvironmentVariable("POLL_DELAY_MS"),
-                out var pd) ? pd : int.Parse(cfg["Queue:PollDelayMilliseconds"] ?? "1500"));
-
-        _maxDequeue = int.TryParse(Environment.GetEnvironmentVariable("MAX_DEQUEUE"),
-            out var md) ? md : int.Parse(cfg["Queue:MaxDequeueBeforePoison"] ?? "5");
-
-        // _queue = new QueueClient(_storageConnectionString, queueName, new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
-        // _poisonQueue = new QueueClient(_storageConnectionString, $"{queueName}-poison", new QueueClientOptions { MessageEncoding = QueueMessageEncoding.Base64 });
-        _tableClient = new TableClient(_storageConnectionString, tableName);
-
-        // _queue.CreateIfNotExists();
-        // _poisonQueue.CreateIfNotExists();
+        
+        _tableClient = new TableClient(_storageConnectionString, TableName);
     }
     
-    [Function(nameof(Worker))]
-    public async Task Run([QueueTrigger("symx-outbound", Connection = "AzureWebJobsStorage")] QueueMessage queueMessage)
+    [Function(nameof(SymxCallQueueListener))]
+    public async Task Run([QueueTrigger(QueueName, Connection = StorageConnectionStringEnvVar)] QueueMessage queueMessage)
     {
         var callId = queueMessage.MessageText;
         _logger.LogInformation("Received: {txId} (dequeue={cnt})", callId, queueMessage.DequeueCount);
