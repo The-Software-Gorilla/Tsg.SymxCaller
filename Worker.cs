@@ -17,8 +17,6 @@ public class Worker
 {
     private const string PartitionKey = "symxCall";
     private readonly ILogger<Worker> _logger;
-    // private readonly QueueClient _queue;
-    // private readonly QueueClient _poisonQueue;
     private readonly TimeSpan _visibility;
     private readonly TimeSpan _pollDelay;
     private readonly int _maxDequeue;
