@@ -147,26 +147,6 @@ public class Worker
             await callbackQueue.SendMessageAsync(response ?? string.Empty);
             // await _queue.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt);
         }
-        // else
-        // {
-        //     if (queueMessage.DequeueCount + 1 >= _maxDequeue)
-        //     {
-        //         await _poisonQueue.SendMessageAsync(queueMessage.MessageText);
-        //     }
-        // }   
-        // }
-        // catch (Exception ex)
-        // {
-        //     _logger.LogError(ex, "Error processing queueMessageId={Id} dequeue={Count}", queueMessage.MessageId, queueMessage.DequeueCount);
-        //
-        //     // Move to poison if it’s looping too many times
-        //     if (queueMessage.DequeueCount + 1 >= _maxDequeue)
-        //     {
-        //         await _poisonQueue.SendMessageAsync(queueMessage.MessageText, stoppingToken);
-        //         await _queue.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, stoppingToken);
-        //         _logger.LogWarning("Moved message to poison queue: {Id}", queueMessage.MessageId);
-        //     }
-        // }
     }
     
     private string ConvertToSoap(SymXSoapEnvelope envelope)
